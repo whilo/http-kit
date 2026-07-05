@@ -277,3 +277,9 @@ The primary use case is [RFC 9110](https://www.rfc-editor.org/rfc/rfc9110.html#s
 ```
 
 This allows you to return the correct Content-Length for HEAD requests without generating the expensive response body.
+
+## HTTP QUERY Requests
+
+http-kit passes QUERY requests to Ring handlers with `:request-method :query`. The request content and `Content-Type` header are available through the usual `:body` and `:headers` keys.
+
+[RFC 10008 sections 2 and 2.1](https://www.rfc-editor.org/rfc/rfc10008.html#section-2) require a server to reject a QUERY request when `Content-Type` is missing or inconsistent with the request content. The Ring handler must validate the media type and content for the resource. RFC 10008 recommends a 400 response for missing or inconsistent media type information and a 415 response for an unsupported media type.

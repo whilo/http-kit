@@ -67,12 +67,17 @@
                                   "&code=" code)}}))))
 
   (ANY "/redirect-nil" [] (fn [req] {:status 302 :headers nil :body ""}))
-  (ANY "/redirect-with-body" [] {:status 302 :headers {"location" "/redirect-target"} :body ""})
+  (ANY "/redirect-with-body" []
+    (fn [req]
+      {:status (to-int (or (-> req :params :code) "302"))
+       :headers {"location" "/redirect-target"}
+       :body ""}))
   (ANY "/redirect-target" []
     (fn [{:keys [request-method body headers]}]
       {:headers {"content-type" "application/edn"}
        :body (pr-str [request-method (some-> body slurp)
-                      (get headers "content-length")])}))
+                      (get headers "content-length")
+                      (get headers "content-type")])}))
   (POST "/multipart"   []
     (fn [req]
       (->> req
@@ -310,7 +315,14 @@
     (is (= m (-> @(hkc/request {:method m
                                 :url "http://127.0.0.1:4347/method"}
                     identity)
-               :headers :x-method read-string)))))
+               :headers :x-method read-string))))
+  (is (= [:query "SELECT 1" "8" "application/sql"]
+        (-> @(hkc/query "http://127.0.0.1:4347/redirect-target"
+               {:body "SELECT 1"
+                :headers {"Content-Type" "application/sql"}
+                :as :text})
+            :body
+            read-string))))
 
 (deftest test-string-file-inputstream-body
   (let [length (+ (rand-int (* 1024 1024 5)) 100)
@@ -539,14 +551,20 @@
 (deftest test-redirect
   (testing "When location header is"
     (testing "present"
-      (let [url "http://localhost:4347/redirect?total=5&n=0"]
+      (let [url "http://localhost:4347/redirect?total=5&n=0"
+            query-opts {:as :text
+                        :body "SELECT 1"
+                        :headers {"Content-Type" "application/sql"}}]
         (is (:error @(hkc/get url {:max-redirects 0})))
         (is (:error @(hkc/get url {:max-redirects 4})))
         (is (= 200 (:status @(hkc/get url {:max-redirects 5}))))
         (is (= 302 (:status @(hkc/get url {:follow-redirects false}))))
         (is (= "get" (:body @(hkc/post url {:as :text}))))     ; should switch to get method
         (is (= "post" (:body @(hkc/post url {:as :text :allow-unsafe-redirect-methods true})))) ; should not change method
-        (is (= "post" (:body @(hkc/post (str url "&code=307") {:as :text})))))) ; should not change method
+        (is (= "post" (:body @(hkc/post (str url "&code=307") {:as :text})))) ; should not change method
+        (is (= "query" (:body @(hkc/query (str url "&code=301") query-opts)))) ; RFC 10008 section 2.5: repeat QUERY
+        (is (= "query" (:body @(hkc/query (str url "&code=302") query-opts)))) ; RFC 10008 section 2.5: repeat QUERY
+        (is (= "get" (:body @(hkc/query (str url "&code=303") query-opts)))))) ; RFC 10008 section 2.5: switch to GET
 
     (testing "nil"
       (let [url "http://localhost:4347/redirect-nil"]
@@ -557,8 +575,14 @@
         (doseq [opts [{:body "secret"}
                       {:form-params {:secret "value"}}
                       {:multipart [{:name "secret" :content "value"}]}]]
-          (is (= [:get nil nil]
-                (read-string (:body @(hkc/post url (assoc opts :as :text)))))))))))
+          (is (= [:get nil nil nil]
+                (read-string (:body @(hkc/post url (assoc opts :as :text)))))))
+        (is (= [:get nil nil nil]
+              (read-string
+                (:body @(hkc/query (str url "?code=303")
+                          {:body "secret"
+                           :headers {"Content-Type" "application/query"}
+                           :as :text})))))))))
 
 (deftest stopping-client-realizes-requests
   (let [started  (promise)

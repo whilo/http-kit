@@ -319,6 +319,9 @@ Value may be a delay. See also `make-client`."}
     (println \"resp1's status: \" (:status @resp1))
     (println \"resp2's status: \" (:status @resp2)))
 
+  RFC 10008 requires QUERY requests to include a `Content-Type` header that
+  matches the request content.
+
   Returned body type is controlled by `:as` option:
 
     Without automatic unzipping:
@@ -396,7 +399,9 @@ Value may be a delay. See also `make-client`."}
                     (let [redirect-location (str (.resolve (URI. url) location-header))
                           change-to-get? (and (not= method HttpMethod/HEAD)
                                               (not allow-unsafe-redirect-methods)
-                                              (#{301 302 303} status))
+                                              (#{301 302 303} status)
+                                              (or (= 303 status)
+                                                  (not= method HttpMethod/QUERY)))
                           cross-origin? (not= (origin url) (origin redirect-location))]
 
                       (if (and (not change-to-get?) (non-repeatable-request? opts))
@@ -484,3 +489,4 @@ Value may be a delay. See also `make-client`."}
 (defreq acl)
 (defreq copy)
 (defreq move)
+(defreq query)
