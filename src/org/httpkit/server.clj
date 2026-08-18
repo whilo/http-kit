@@ -91,6 +91,22 @@
     :max-ws                     ; Max WebSocket message size in bytes (default: 4MB)
     :max-line                   ; Max HTTP header line size in bytes (default: 8KB)
 
+    :max-queued-bytes           ; Per-connection ceiling on bytes queued for write;
+                                ; past it the connection is closed. DEFAULT 0 (OFF).
+                                ; Off because a size ceiling cannot yet tell a
+                                ; stalled peer from a large response: http-kit
+                                ; materialises a whole body into one buffer, so a
+                                ; 100MB download to a healthy client arrives as one
+                                ; 100MB enqueue. Enable it for servers whose
+                                ; responses are small and incremental (WebSocket,
+                                ; SSE). Worst case is this times max connections.
+    :queue-high-water-bytes     ; Per-connection mark above which `writable?` is
+                                ; false (default: 64KB, as Netty). <=0 disables.
+    :queue-low-water-bytes      ; ...and below which it becomes true again
+                                ; (default: 32KB). Two marks give hysteresis: with
+                                ; one, a connection at the boundary flips on every
+                                ; write. Must not exceed the high mark.
+
     :proxy-protocol             ; Proxy protocol e/o #{:disable :enable :optional}
 
     :server-header              ; The \"Server\" header, disabled if nil. Default: \"http-kit\".
@@ -134,6 +150,7 @@
               error-logger warn-logger event-logger event-names
               legacy-return-value? legacy-unsafe-remote-addr? legacy-content-length?
               server-header address-finder
+              max-queued-bytes queue-high-water-bytes queue-low-water-bytes
               channel-factory ring-async?] :as opts
 
        :or   {ip         "0.0.0.0"
@@ -197,6 +214,7 @@
           (reify HttpServer$ServerChannelFactory (createChannel [this addr] (channel-factory addr)))
           (reify HttpServer$ServerChannelFactory (createChannel [this addr] (ServerSocketChannel/open))))
 
+        ^HttpServer
         s (HttpServer. address-finder channel-factory h
                        ^long max-body ^long max-line ^long max-ws proxy-enum ^String server-header
                        (boolean legacy-unsafe-remote-addr?)
@@ -204,6 +222,20 @@
                        warn-logger
                        evt-logger
                        evt-names)]
+
+    ;; Set after construction rather than threaded through every constructor
+    ;; overload; both are volatile and read on each write.
+    (when max-queued-bytes
+      (set! (.-maxQueuedBytes s) (long max-queued-bytes)))
+    (when queue-high-water-bytes
+      (set! (.-queueHighWaterBytes s) (long queue-high-water-bytes)))
+    (when queue-low-water-bytes
+      (set! (.-queueLowWaterBytes s) (long queue-low-water-bytes)))
+    (when (> (.-queueLowWaterBytes s) (.-queueHighWaterBytes s))
+      (throw (IllegalArgumentException.
+              (str ":queue-low-water-bytes (" (.-queueLowWaterBytes s) ") must not exceed"
+                   " :queue-high-water-bytes (" (.-queueHighWaterBytes s) ")"))))
+
     (.start s)
 
     (if-not legacy-return-value?
@@ -287,6 +319,31 @@
     "Closes the channel. Idempotent: returns true if the channel was actually
     closed, or false if it was already closed.")
 
+  (writable? [ch]
+    "Is the peer keeping up?
+
+    False once more than `:queue-high-water-bytes` is queued for this
+    connection, and true again only once the queue falls below
+    `:queue-low-water-bytes` -- two marks, so a connection sitting at the
+    boundary does not flip state on every write.
+
+    `send!` is unaffected: a write past the mark is still accepted. This is how
+    a caller decides whether to offer more, and `on-writable` is how it learns
+    it may resume. Same shape as Netty's `Channel.isWritable()`.")
+
+  (queued-bytes [ch]
+    "Bytes accepted from the application but not yet written to the socket for
+    this channel. A gauge, for metrics; stale on return by construction.")
+
+  (on-writable [ch callback]
+    "Register `(fn [])`, called once each time writability is RESTORED.
+
+    The transition, not the state, so draining a large queue does not become a
+    callback storm. Equivalent to Netty's `channelWritabilityChanged`, Node's
+    `'drain'` and Servlet 3.1's `onWritePossible`.
+
+    Runs on the IO thread: offer more data and return, do not block.")
+
   (send! [ch data] [ch data close-after-send?]
     "Sends data to client and returns true if the data was successfully sent,
     or false if the channel is closed. Data is sent directly to the client,
@@ -331,6 +388,10 @@
   (open?      [ch] (not (.isClosed ch)))
   (websocket? [ch] (.isWebSocket   ch))
   (close      [ch] (.serverClose   ch 1000))
+  (writable?    [ch] (.writable     ch))
+  (queued-bytes [ch] (.queuedBytes  ch))
+  (on-writable  [ch callback] (.setWritableHandler ch callback))
+
   (send!
     ([ch data                  ] (.send ch data (not (websocket? ch))))
     ([ch data close-after-send?] (.send ch data (boolean close-after-send?))))
@@ -447,12 +508,23 @@
         (if-let [sec-ws-accept (websocket-handshake-check rreq)]
           (let [l listener
                 sock
-                (reify wsp/Socket
+                (reify
+                  wsp/Socket
                   (-open? [_]        (not (.isClosed    ch)))
                   (-send  [_ msg]         (.send        ch (if (string? msg) msg (buffer->bytes msg))     false))
                   (-ping  [_ bb-data]     (.send        ch (Frame$PingFrame.     (buffer->bytes bb-data)) false))
                   (-pong  [_ bb-data]     (.send        ch (Frame$PongFrame.     (buffer->bytes bb-data)) false))
-                  (-close [_ code reason] (.serverClose ch code reason)))]
+                  (-close [_ code reason] (.serverClose ch code reason))
+
+                  wsp/AsyncSocket
+                  (-send-async [_ msg succeed fail]
+                    (let [data (if (string? msg) msg (buffer->bytes msg))
+                          result (try
+                                   {:immediate? (.sendAsync ch data succeed fail)}
+                                   (catch Throwable t {:error t}))]
+                      (if-let [error (:error result)]
+                        (fail error)
+                        (when (:immediate? result) (succeed))))))]
 
             (when (satisfies? wsp/PingListener listener)
               (.setPingHandler    ch (fn [ba-msg]      (wsp/on-ping    l sock                       (ByteBuffer/wrap ba-msg)))))

@@ -167,6 +167,48 @@ These look the same on the surface, but let's dive deeper:
 
 # Advanced topics
 
+## Outbound backpressure
+
+A channel accepts everything you `send!` it. If the peer stops reading, the
+data queues in the server, and without a signal that queue is unbounded — one
+non-reading client was measured taking 1.36 GB of heap in 8 seconds while
+`send!` returned `true` on every call.
+
+`writable?` is the signal, and `on-writable` tells you when you may resume:
+
+```clojure
+(defn push! [ch msgs]
+  (if-let [m (first msgs)]
+    (do (hk-server/send! ch m false)
+        (if (hk-server/writable? ch)
+          (recur ch (rest msgs))
+          ;; The peer is behind. Stop offering; we will be called back.
+          (hk-server/on-writable ch #(push! ch (rest msgs)))))
+    :done))
+```
+
+This is the same shape as Netty's `Channel.isWritable()` +
+`channelWritabilityChanged`, Node's `write()` + `'drain'`, and Servlet 3.1's
+`isReady()` + `onWritePossible`.
+
+Notes:
+
+- **`send!` is unaffected.** A write past the mark is still accepted; `send!`
+  returns `false` only when the channel is closed, as it always has.
+- **There are two marks.** `writable?` goes false above
+  `:queue-high-water-bytes` (default 64 KB) and true again only below
+  `:queue-low-water-bytes` (default 32 KB). One threshold would make a
+  connection sitting at the boundary flip on every write.
+- **`on-writable` fires on the transition**, not on every drain, and runs on
+  the IO thread — offer more data and return, do not block.
+- **`queued-bytes`** is a gauge for metrics.
+- **`:max-queued-bytes`** is a hard ceiling that closes the connection, and is
+  **off by default**. It cannot currently distinguish a stalled peer from a
+  large response, because a whole body is materialised into one buffer: a
+  100 MB download to a healthy client arrives as one 100 MB enqueue. Enable it
+  only where responses are small and incremental, and note the bound is per
+  connection.
+
 ## Custom request queues
 
 http-kit server's worker pool can be easily customised for arbitrary control and monitoring, e.g.:

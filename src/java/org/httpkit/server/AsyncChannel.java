@@ -85,7 +85,7 @@ public class AsyncChannel {
     }
 
     // Write first HTTP header and [first chunk data]? to client
-    private void firstWrite(Object data, boolean close) throws IOException {
+    private boolean firstWrite(Object data, boolean close) throws IOException {
         ByteBuffer buffers[];
         int status = 200;
         Object body = data;
@@ -151,7 +151,7 @@ public class AsyncChannel {
         if (closeAfterResponse) {
             server.closeAfterResponse(key);
         }
-        server.tryWrite(key, !close, buffers);
+        boolean immediate = server.tryWrite(key, !close, buffers);
         if (close) {
             try {
                 onClose(0);
@@ -159,10 +159,12 @@ public class AsyncChannel {
                 server.responseComplete(key);
             }
         }
+        return immediate;
     }
 
     // for streaming, send a chunk of data to client
-    private void writeChunk(Object body, boolean close) throws IOException {
+    private boolean writeChunk(Object body, boolean close) throws IOException {
+        boolean immediate = true;
         if (body instanceof Map) { // only get body if a map
             body = ((Map<Keyword, Object>) body).get(BODY);
         }
@@ -179,12 +181,13 @@ public class AsyncChannel {
                 } else {
                     buffers = new ByteBuffer[]{t};
                 }
-                server.tryWrite(key, true, buffers);
+                immediate = server.tryWrite(key, true, buffers);
             }
         }
         if (close) {
             serverClose(0);
         }
+        return immediate;
     }
 
     public void setReceiveHandler(IFn fn) {
@@ -345,7 +348,6 @@ public class AsyncChannel {
         if (closedRan.get()) {
             return false;
         }
-
         if (websocketUpgraded) {
             if (data instanceof Map) { // only get the :body if map
                 Object tmp = ((Map<Keyword, Object>) data).get(BODY);
@@ -383,6 +385,79 @@ public class AsyncChannel {
             }
         }
         return true;
+    }
+
+    /**
+     * Queue one WebSocket message with completion callbacks for Ring's
+     * AsyncSocket. Returns true only when every byte reached the socket in the
+     * caller's write; otherwise HttpServer retains the callbacks with the
+     * queued bytes and invokes exactly one of them later.
+     */
+    public synchronized boolean sendAsync(Object data, IFn succeed, IFn fail) throws IOException {
+        if (closedRan.get()) {
+            throw new IOException("channel is closed");
+        }
+        if (!websocketUpgraded) {
+            throw new IllegalStateException("asynchronous Ring writes require a WebSocket channel");
+        }
+        if (data instanceof String) {
+            return server.tryWriteAsync(key, succeed, fail,
+                    WsEncode(OPCODE_TEXT, ((String) data).getBytes(UTF_8)));
+        } else if (data instanceof byte[]) {
+            return server.tryWriteAsync(key, succeed, fail,
+                    WsEncode(OPCODE_BINARY, (byte[]) data));
+        } else if (data instanceof InputStream) {
+            DynamicBytes bytes = readAll((InputStream) data);
+            return server.tryWriteAsync(key, succeed, fail,
+                    WsEncode(OPCODE_BINARY, bytes.get(), bytes.length()));
+        }
+        throw new IllegalArgumentException("asynchronous WebSocket send expects string, byte[], or InputStream");
+    }
+
+    /**
+     * Whether the peer is keeping up.
+     *
+     * <p>Goes false once more than {@code queueHighWaterBytes} is queued for
+     * this connection, and true again only once the queue falls below
+     * {@code queueLowWaterBytes} -- two marks, so a connection sitting at the
+     * boundary does not flip on every write. This is the same shape as
+     * Netty's {@code Channel.isWritable()}.
+     *
+     * <p>{@code send!} is unaffected: a write past the mark is still accepted,
+     * exactly as Netty's {@code write()} is. This predicate is how a caller
+     * decides whether to offer more.
+     */
+    public boolean writable() {
+        ServerAtta atta = (ServerAtta) key.attachment();
+        return atta == null || atta.writable();
+    }
+
+    /** Bytes accepted from the application but not yet written to the socket. */
+    public long queuedBytes() {
+        ServerAtta atta = (ServerAtta) key.attachment();
+        return atta == null ? 0 : atta.queuedBytes();
+    }
+
+    private volatile IFn writableHandler;
+
+    /**
+     * Called once each time writability is RESTORED -- the transition, not the
+     * state, so a drain does not become a callback storm. Equivalent to
+     * Netty's {@code channelWritabilityChanged}, Node's {@code 'drain'}, and
+     * Servlet 3.1's {@code onWritePossible}.
+     *
+     * <p>Runs on the IO thread, so it must not block. Offer more data and
+     * return.
+     */
+    public void setWritableHandler(IFn fn) {
+        writableHandler = fn;
+    }
+
+    void onWritable() {
+        IFn f = writableHandler;
+        if (f != null) {
+            f.invoke();
+        }
     }
 
     public String toString() {
