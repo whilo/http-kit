@@ -91,9 +91,10 @@
     :max-ws                     ; Max WebSocket message size in bytes (default: 4MB)
     :max-line                   ; Max HTTP header line size in bytes (default: 8KB)
 
-    :max-queued-bytes           ; Per-connection ceiling on bytes queued for write;
-                                ; past it the connection is closed. DEFAULT 0 (OFF).
-                                ; Off because a size ceiling cannot yet tell a
+    :max-queued-bytes           ; Per-connection close threshold for queued write
+                                ; bytes. Concurrent producers may overshoot before
+                                ; the selector closes. DEFAULT 0 (OFF).
+                                ; Off because a size threshold cannot yet tell a
                                 ; stalled peer from a large response: http-kit
                                 ; materialises a whole body into one buffer, so a
                                 ; 100MB download to a healthy client arrives as one
@@ -165,7 +166,27 @@
               ring-async? false
               legacy-content-length? true}}]]
 
-  (let [^ContextLogger err-logger
+  (let [queue-high-water-bytes
+        (long (if (some? queue-high-water-bytes)
+                queue-high-water-bytes
+                (* 64 1024)))
+        ;; A non-positive high mark disables the signal, including its low
+        ;; mark. That makes the documented one-option opt-out work.
+        queue-low-water-bytes
+        (long (if (pos? queue-high-water-bytes)
+                (if (some? queue-low-water-bytes)
+                  queue-low-water-bytes
+                  (* 32 1024))
+                0))
+        max-queued-bytes (long (or max-queued-bytes 0))
+        _ (when (and (pos? queue-high-water-bytes)
+                     (or (neg? queue-low-water-bytes)
+                         (> queue-low-water-bytes queue-high-water-bytes)))
+            (throw (IllegalArgumentException.
+                    (str ":queue-low-water-bytes (" queue-low-water-bytes ") must be non-negative"
+                         " and not exceed :queue-high-water-bytes (" queue-high-water-bytes ")"))))
+
+        ^ContextLogger err-logger
         (if error-logger
           (reify ContextLogger (log [this message error] (error-logger message error)))
           (do ContextLogger/ERROR_PRINTER))
@@ -224,17 +245,11 @@
                        evt-names)]
 
     ;; Set after construction rather than threaded through every constructor
-    ;; overload; both are volatile and read on each write.
-    (when max-queued-bytes
-      (set! (.-maxQueuedBytes s) (long max-queued-bytes)))
-    (when queue-high-water-bytes
-      (set! (.-queueHighWaterBytes s) (long queue-high-water-bytes)))
-    (when queue-low-water-bytes
-      (set! (.-queueLowWaterBytes s) (long queue-low-water-bytes)))
-    (when (> (.-queueLowWaterBytes s) (.-queueHighWaterBytes s))
-      (throw (IllegalArgumentException.
-              (str ":queue-low-water-bytes (" (.-queueLowWaterBytes s) ") must not exceed"
-                   " :queue-high-water-bytes (" (.-queueHighWaterBytes s) ")"))))
+    ;; overload; these are volatile and read on each write. Values were
+    ;; normalized and validated before constructing (and binding) the server.
+    (set! (.-maxQueuedBytes s) max-queued-bytes)
+    (set! (.-queueHighWaterBytes s) queue-high-water-bytes)
+    (set! (.-queueLowWaterBytes s) queue-low-water-bytes)
 
     (.start s)
 
@@ -336,11 +351,12 @@
     this channel. A gauge, for metrics; stale on return by construction.")
 
   (on-writable [ch callback]
-    "Register `(fn [])`, called once each time writability is RESTORED.
+    "Register a one-shot `(fn [])` continuation for writable state.
 
-    The transition, not the state, so draining a large queue does not become a
-    callback storm. Equivalent to Netty's `channelWritabilityChanged`, Node's
-    `'drain'` and Servlet 3.1's `onWritePossible`.
+    If the channel is already writable it is scheduled immediately; otherwise
+    it is called once when writability is restored. Registration and state
+    observation are atomic, so the restore edge cannot be lost after a caller
+    observed `writable?` as false.
 
     Runs on the IO thread: offer more data and return, do not block.")
 
@@ -492,6 +508,15 @@
     (.get buf bs 0 len)
     bs))
 
+(defn- ring-websocket-data [msg]
+  (cond
+    (instance? CharSequence msg) (.toString ^CharSequence msg)
+    (instance? ByteBuffer msg)   (buffer->bytes msg)
+    :else
+    (throw (IllegalArgumentException.
+            (str "Ring WebSocket send expects CharSequence or ByteBuffer, got "
+                 (some-> msg class .getName))))))
+
 (def ^:private no-ring-websockets?
   "Should support for `org.ring-clojure/ring-websocket-protocols` be disabled?
   There shouldn't be any reason besides testing to use this."
@@ -511,16 +536,16 @@
                 (reify
                   wsp/Socket
                   (-open? [_]        (not (.isClosed    ch)))
-                  (-send  [_ msg]         (.send        ch (if (string? msg) msg (buffer->bytes msg))     false))
+                  (-send  [_ msg]         (.send        ch (ring-websocket-data msg)                      false))
                   (-ping  [_ bb-data]     (.send        ch (Frame$PingFrame.     (buffer->bytes bb-data)) false))
                   (-pong  [_ bb-data]     (.send        ch (Frame$PongFrame.     (buffer->bytes bb-data)) false))
                   (-close [_ code reason] (.serverClose ch code reason))
 
                   wsp/AsyncSocket
                   (-send-async [_ msg succeed fail]
-                    (let [data (if (string? msg) msg (buffer->bytes msg))
-                          result (try
-                                   {:immediate? (.sendAsync ch data succeed fail)}
+                    (let [result (try
+                                   {:immediate? (.sendAsync ch (ring-websocket-data msg)
+                                                            succeed fail)}
                                    (catch Throwable t {:error t}))]
                       (if-let [error (:error result)]
                         (fail error)

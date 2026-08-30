@@ -199,15 +199,18 @@ Notes:
   `:queue-high-water-bytes` (default 64 KB) and true again only below
   `:queue-low-water-bytes` (default 32 KB). One threshold would make a
   connection sitting at the boundary flip on every write.
-- **`on-writable` fires on the transition**, not on every drain, and runs on
-  the IO thread — offer more data and return, do not block.
+- **`on-writable` is one-shot and race-free.** If already writable it is
+  scheduled immediately; otherwise it runs once when writability is restored. Register
+  again after the next pause. It runs on the IO thread when called by a drain —
+  offer more data and return, do not block.
 - **`queued-bytes`** is a gauge for metrics.
-- **`:max-queued-bytes`** is a hard ceiling that closes the connection, and is
+- **`:max-queued-bytes`** is a close threshold, and is
   **off by default**. It cannot currently distinguish a stalled peer from a
   large response, because a whole body is materialised into one buffer: a
   100 MB download to a healthy client arrives as one 100 MB enqueue. Enable it
-  only where responses are small and incremental, and note the bound is per
-  connection.
+  only where responses are small and incremental, and note the threshold is per
+  connection. Concurrent producers may overshoot it before the selector
+  processes the close.
 
 ## Custom request queues
 

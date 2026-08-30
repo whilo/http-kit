@@ -392,6 +392,11 @@ public class AsyncChannel {
      * AsyncSocket. Returns true only when every byte reached the socket in the
      * caller's write; otherwise HttpServer retains the callbacks with the
      * queued bytes and invokes exactly one of them later.
+     *
+     * <p>Message bytes retain socket order. Applications making concurrent
+     * sends must not use callback observation order as a serialization
+     * primitive: callbacks run outside the queue lock and may interleave with
+     * a close or another caller.
      */
     public synchronized boolean sendAsync(Object data, IFn succeed, IFn fail) throws IOException {
         if (closedRan.get()) {
@@ -438,26 +443,44 @@ public class AsyncChannel {
         return atta == null ? 0 : atta.queuedBytes();
     }
 
-    private volatile IFn writableHandler;
+    /** One-shot continuation guarded by the attached ServerAtta's monitor. */
+    private IFn writableHandler;
 
     /**
-     * Called once each time writability is RESTORED -- the transition, not the
-     * state, so a drain does not become a callback storm. Equivalent to
-     * Netty's {@code channelWritabilityChanged}, Node's {@code 'drain'}, and
-     * Servlet 3.1's {@code onWritePossible}.
+     * Register a one-shot continuation for writable state. If already
+     * writable, it is scheduled immediately; otherwise it runs when
+     * writability is restored. Observing the state and installing the
+     * continuation share the queue lock, so the restore edge cannot be lost
+     * between {@link #writable()} and this call.
      *
      * <p>Runs on the IO thread, so it must not block. Offer more data and
      * return.
      */
     public void setWritableHandler(IFn fn) {
-        writableHandler = fn;
+        ServerAtta atta = (ServerAtta) key.attachment();
+        if (atta == null) {
+            return;
+        } else {
+            boolean notify;
+            synchronized (atta) {
+                if (closedRan.get() || !key.channel().isOpen()) {
+                    writableHandler = null;
+                    return;
+                }
+                writableHandler = fn;
+                notify = fn != null && !atta.unwritable;
+            }
+            if (notify) {
+                server.requestWritableCallback(key);
+            }
+        }
     }
 
-    void onWritable() {
+    /** Called with the attached ServerAtta's monitor held. */
+    IFn takeWritableHandler() {
         IFn f = writableHandler;
-        if (f != null) {
-            f.invoke();
-        }
+        writableHandler = null;
+        return f;
     }
 
     public String toString() {

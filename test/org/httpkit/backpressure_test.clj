@@ -11,7 +11,8 @@
             [ring.websocket.protocols :as wsp])
   (:import [java.net InetSocketAddress Socket SocketTimeoutException]
            [java.io OutputStreamWriter BufferedWriter]
-           [java.nio ByteBuffer]))
+           [java.nio ByteBuffer]
+           [java.nio.channels ServerSocketChannel]))
 
 (defn- slurp-bytes [url]
   (let [c (java.net.http.HttpClient/newHttpClient)
@@ -144,10 +145,9 @@
     ;; onWritePossible.
     (let [fired (atom 0)
           chans (atom #{})
-          stop (hk/run-server
+        stop (hk/run-server
                 (fn [req] (hk/as-channel req
                             {:on-open (fn [ch]
-                                        (hk/on-writable ch (fn [] (swap! fired inc)))
                                         (swap! chans conj ch)
                                         (hk/send! ch {:status 200 :body "x\n"} false))
                              :on-close (fn [ch _] (swap! chans disj ch))}))
@@ -164,6 +164,7 @@
           (blast! ch 600 (fn [_] (not (hk/writable? ch))))
           (is (not (hk/writable? ch)) "never went unwritable, so nothing to restore")
           (is (zero? @fired) "must not fire before writability was lost")
+          (hk/on-writable ch (fn [] (swap! fired inc)))
           ;; ...then drain, and the transition must be announced.
           (.setSoTimeout sock 250)
           (let [in (.getInputStream sock) buf (byte-array 65536)
@@ -173,8 +174,53 @@
                             (catch SocketTimeoutException _ 0))
                        (recur))))
           (is (pos? @fired) "on-writable never fired after the queue drained")
-          (is (hk/writable? ch)))
+          (is (hk/writable? ch))
+
+          ;; The continuation is one-shot. Let a second restoration happen
+          ;; with nobody waiting, then register after that edge: registration
+          ;; must run immediately instead of losing the wakeup.
+          (blast! ch 600 (fn [_] (not (hk/writable? ch))))
+          (is (not (hk/writable? ch)) "second cycle never went unwritable")
+          (let [in (.getInputStream sock) buf (byte-array 65536)
+                deadline (+ (System/currentTimeMillis) 10000)]
+            (loop [] (when (and (not (hk/writable? ch))
+                                (< (System/currentTimeMillis) deadline))
+                       (try (.read in buf)
+                            (catch SocketTimeoutException _ 0))
+                       (recur))))
+          (is (hk/writable? ch) "second cycle never restored")
+          (is (= 1 @fired) "the first continuation must not persist")
+          (hk/on-writable ch (fn [] (swap! fired inc)))
+          (loop [n 0]
+            (when (and (= 1 @fired) (< n 100))
+              (Thread/sleep 5)
+              (recur (inc n))))
+          (is (= 2 @fired)
+              "registration after a missed restore edge must run promptly"))
         (finally (.close sock) (stop))))))
+
+(deftest watermark-options-are-normalized-before-server-construction
+  (testing "the documented one-option disable works"
+    (let [stop (hk/run-server (constantly {:status 200 :body "ok"})
+                              {:port 0 :queue-high-water-bytes 0})]
+      (try
+        (is (pos? (:local-port (meta stop))))
+        (finally (stop)))))
+
+  (testing "invalid marks fail before a server channel is opened"
+    (let [factory-calls (atom 0)]
+      (is (thrown? IllegalArgumentException
+                   (hk/run-server
+                    (constantly {:status 200 :body "ok"})
+                    {:port 0
+                     :queue-high-water-bytes 1
+                     :queue-low-water-bytes 2
+                     :channel-factory
+                     (fn [_]
+                       (swap! factory-calls inc)
+                       (ServerSocketChannel/open))})))
+      (is (zero? @factory-calls)
+          "validation must precede opening or binding server resources"))))
 
 (deftest queued-bytes-tracks-the-backlog
   (testing "queued-bytes exposes the backlog, so a caller can resume"
@@ -278,7 +324,15 @@
                   "success callback never followed the drained write")
               (Thread/sleep 50)
               (is (= 1 @successes))
-              (is (zero? @failures)))))
+              (is (zero? @failures))
+
+              (let [invalid-failed (promise)]
+                (ws/send socket 42
+                         #(deliver invalid-failed :unexpected-success)
+                         #(deliver invalid-failed %))
+                (is (instance? IllegalArgumentException
+                               (await-result invalid-failed))
+                    "async validation errors must reach fail, not escape")))))
         (finally (.close ^Socket sock) (stop))))))
 
 (deftest ring-async-send-fails-when-a-queued-write-is-abandoned

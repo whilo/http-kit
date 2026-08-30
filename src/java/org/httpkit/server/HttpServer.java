@@ -56,6 +56,7 @@ class PendingKey {
 
     public static final int OP_WRITE = -1;
     public static final int RESPONSE_COMPLETE = -2;
+    public static final int NOTIFY_WRITABLE = -3;
 }
 
 public class HttpServer implements Runnable {
@@ -93,16 +94,18 @@ public class HttpServer implements Runnable {
     private final ByteBuffer buffer = ByteBuffer.allocateDirect(1024 * 64 - 1);
 
     /**
-     * Per-connection ceiling on bytes queued for write. Exceeding it closes
-     * the connection. Zero or negative (the DEFAULT) disables the ceiling.
+     * Per-connection close threshold for bytes queued for write. Exceeding it
+     * schedules the connection for close; concurrent producers can overshoot
+     * before the selector processes that close. Zero or negative (the DEFAULT)
+     * disables the threshold.
      *
-     * <p><b>Off by default, deliberately.</b> A size ceiling cannot currently
+     * <p><b>Off by default, deliberately.</b> A size threshold cannot currently
      * distinguish a stalled peer from a large response, because
      * {@code HttpUtils.bodyBuffer} materialises a whole body into a single
      * ByteBuffer: a 100 MB download to a perfectly healthy client arrives at
-     * {@code tryWrite} as one 100 MB enqueue and would trip any ceiling below
-     * it. Measured: with a 64 MiB ceiling that download is truncated; with the
-     * ceiling off it completes. Enabling this is therefore a deployment
+     * {@code tryWrite} as one 100 MB enqueue and would trip any threshold below
+     * it. Measured: with a 64 MiB threshold that download is truncated; with the
+     * threshold off it completes. Enabling this is therefore a deployment
      * decision for a server whose responses are known to be small and
      * incremental -- typically WebSocket or SSE.
      *
@@ -536,7 +539,7 @@ public class HttpServer implements Runnable {
     private void doWrite(SelectionKey key) {
         ServerAtta atta = (ServerAtta) key.attachment();
         SocketChannel ch = (SocketChannel) key.channel();
-        boolean fireWritable = false;
+        IFn writableCallback = null;
         LinkedList<IFn> completedWrites = null;
         try {
             // the sync is per socket (per client). virtually, no contention
@@ -564,7 +567,9 @@ public class HttpServer implements Runnable {
                         ite.remove();
                     }
                 }
-                fireWritable = restoredWritability(atta);
+                if (restoredWritability(atta) && atta.channel != null) {
+                    writableCallback = atta.channel.takeWritableHandler();
+                }
                 // all done
                 if (toWrites.size() == 0) {
                     if (atta.isKeepAlive()) {
@@ -584,12 +589,11 @@ public class HttpServer implements Runnable {
             return;
         }
         // Fired OUTSIDE the lock: application callbacks must never run while
-        // holding the per-connection monitor the write path needs. Completion
-        // order is FIFO, matching the bytes on the socket.
+        // holding the per-connection monitor the write path needs. Byte
+        // ownership is completed FIFO; observation of callbacks may interleave
+        // with concurrent callers or close after the lock is released.
         invokeWriteCallbacks(completedWrites, null);
-        if (fireWritable && atta.channel != null) {
-            atta.channel.onWritable();
-        }
+        invokeWriteCallback(writableCallback, null);
     }
 
     public boolean tryWrite(final SelectionKey key, ByteBuffer... buffers) {
@@ -688,12 +692,18 @@ public class HttpServer implements Runnable {
     private void invokeWriteCallbacks(LinkedList<IFn> callbacks, Throwable failure) {
         if (callbacks == null) return;
         for (IFn callback : callbacks) {
-            try {
-                if (failure == null) callback.invoke();
-                else callback.invoke(failure);
-            } catch (Throwable e) {
-                Telemetry.log(warnLogger, "asynchronous write callback failed", e);
-            }
+            invokeWriteCallback(callback, failure);
+        }
+    }
+
+    /** Invoke application completion code without endangering the selector. */
+    void invokeWriteCallback(IFn callback, Throwable failure) {
+        if (callback == null) return;
+        try {
+            if (failure == null) callback.invoke();
+            else callback.invoke(failure);
+        } catch (Throwable e) {
+            Telemetry.log(warnLogger, "asynchronous write callback failed", e);
         }
     }
 
@@ -748,6 +758,24 @@ public class HttpServer implements Runnable {
         selector.wakeup();
     }
 
+    void requestWritableCallback(SelectionKey key) {
+        pending.add(new PendingKey(key, PendingKey.NOTIFY_WRITABLE));
+        selector.wakeup();
+    }
+
+    private void notifyWritable(SelectionKey key) {
+        ServerAtta atta = (ServerAtta) key.attachment();
+        IFn callback = null;
+        if (atta != null) {
+            synchronized (atta) {
+                if (key.channel().isOpen() && !atta.unwritable && atta.channel != null) {
+                    callback = atta.channel.takeWritableHandler();
+                }
+            }
+        }
+        invokeWriteCallback(callback, null);
+    }
+
     void closeAfterResponse(SelectionKey key) {
         ServerAtta atta = (ServerAtta) key.attachment();
         synchronized (atta) {
@@ -778,6 +806,8 @@ public class HttpServer implements Runnable {
                         }
                     } else if (k.Op == PendingKey.RESPONSE_COMPLETE) {
                         resumeAfterResponse(k.key);
+                    } else if (k.Op == PendingKey.NOTIFY_WRITABLE) {
+                        notifyWritable(k.key);
                     } else {
                         closeKey(k.key, k.Op);
                     }
